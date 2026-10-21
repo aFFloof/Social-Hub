@@ -6,6 +6,7 @@ const MAX_PLAYERS = 8;
 const WORLD_W = 700;
 const WORLD_H = 780;
 const PLAYER_RADIUS = 22;
+const DISCONNECT_GRACE_MS = 60000;
 const VALID_COLORS = new Set(["sky","mint","coral","violet","amber","slate"]);
 const VALID_SHAPES = new Set(["pill","round","tall","squat"]);
 const VALID_HATS = new Set(["none","cap","crown","cowboy","wizard","halo","party","flower","antenna","mushroom","chef","saturn"]);
@@ -52,6 +53,7 @@ function defaultPlayer(id, name, index = 0) {
     mask: "none",
     color: "sky",
     shape: "pill",
+    disconnectedAt: null,
   };
 }
 
@@ -130,7 +132,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, service: "social-hub-coop" });
+      return Response.json({ ok: true, service: "social-hub-coop", version: "0.6.2" });
     }
 
     if (url.pathname === "/ws") {
@@ -291,6 +293,7 @@ export class LobbyRoom extends DurableObject {
       } else {
         existing.name = name;
         existing.seenAt = Date.now();
+        existing.disconnectedAt = null;
       }
 
       if (!this.room.hostId) this.room.hostId = id;
@@ -542,18 +545,62 @@ export class LobbyRoom extends DurableObject {
     }
   }
 
+  hasLiveSocket(id, except = null) {
+    return this.sockets().some(peer => peer !== except && this.attachment(peer).id === id);
+  }
+
+  async markDisconnected(id, ws) {
+    if (!this.room || !id) return;
+    if (this.hasLiveSocket(id, ws)) return;
+
+    const p = this.player(id);
+    if (!p) return;
+
+    p.disconnectedAt = Date.now();
+    await this.persist(true);
+    await this.ctx.storage.setAlarm(Date.now() + DISCONNECT_GRACE_MS);
+  }
+
   async webSocketClose(ws) {
     const { id } = this.attachment(ws);
-    if (id) await this.removePlayer(id, true);
+    if (id) await this.markDisconnected(id, ws);
   }
 
   async webSocketError(ws) {
     const { id } = this.attachment(ws);
-    if (id) await this.removePlayer(id, true);
+    if (id) await this.markDisconnected(id, ws);
   }
 
   async alarm() {
-    if (this.sockets().length === 0) {
+    if (!this.room) return;
+
+    const cutoff = Date.now() - DISCONNECT_GRACE_MS;
+    const stale = this.room.players.filter(p =>
+      p.disconnectedAt && p.disconnectedAt <= cutoff && !this.hasLiveSocket(p.id)
+    );
+
+    for (const p of stale) {
+      this.room.players = this.room.players.filter(x => x.id !== p.id);
+      systemMessage(this.room, `${p.name} disconnected.`);
+    }
+
+    if (stale.length) {
+      this.ensureHost();
+      this.sanitizeActivity();
+      await this.persist(true);
+      this.broadcast({ type: "snapshot", state: this.room });
+    }
+
+    const pending = this.room.players
+      .filter(p => p.disconnectedAt && !this.hasLiveSocket(p.id))
+      .map(p => p.disconnectedAt + DISCONNECT_GRACE_MS);
+
+    if (pending.length) {
+      await this.ctx.storage.setAlarm(Math.min(...pending));
+      return;
+    }
+
+    if (this.room.players.length === 0 && this.sockets().length === 0) {
       this.room = null;
       await this.ctx.storage.deleteAll();
     }
