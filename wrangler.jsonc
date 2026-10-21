@@ -1,0 +1,19 @@
+{
+  "name": "social-hub-coop",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-21",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LOBBY_ROOMS",
+        "class_name": "LobbyRoom"
+      }
+    ]
+  },
+  "exports": {
+    "LobbyRoom": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
